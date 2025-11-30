@@ -8,7 +8,7 @@ When you copy a link from sites like Amazon, Facebook, or YouTube, they attach "
 **Clipboard Defanger** runs silently in your system tray. It monitors your clipboard, and the moment you copy a "dirty" link, it instantly strips the tracking tags (`utm_source`, `fbclid`, etc.) so you paste a clean, private URL.
 
 ## Download
-[**Download the latest Installer here**](https://github.com/YOUR_USERNAME/Clipboard-Defanger/releases)
+[**Download the latest Installer here**](https://github.com/mkultraware/Clipboard-Defanger/releases)
 
 ## ✨ Features
 * **Zero-Click:** Just copy and paste. It happens automatically.
