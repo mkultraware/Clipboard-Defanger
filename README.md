@@ -32,8 +32,11 @@ If you prefer not to use the EXE, you can run the script directly:
 
 ##  License & Pricing
 
-**Personal Use:** This software is free for personal, non-commercial use. You can download and use it on your personal devices without charge.
+**Personal Use:** This software is free for personal, non-commercial use on your own devices.
 
-**Commercial Use:** Use in a commercial environment (business, enterprise, or for-profit organization) requires a license fee. The installer will guide you to the payment page, or you can [pay for a commercial license here](https://paypal.me/mkultraware).
+**Commercial Use:** Use in a commercial environment (business, enterprise, or government) requires a paid license. 
 
-**Redistribution:** You may not sell this software or repackage it for sale without explicit permission.
+**Pricing:** We offer flexible licensing options for teams and enterprises.
+📧 **[Contact us for a quote](mailto:ademiernest@proton.me)** to discuss your deployment needs.
+
+**Redistribution:** You may not sell this software or repackage it without explicit permission.
