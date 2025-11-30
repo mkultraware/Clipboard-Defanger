@@ -28,3 +28,12 @@ If you prefer not to use the EXE, you can run the script directly:
     ```bash
     python clipboard_defanger.py
     ```
+
+
+##  License & Pricing
+
+**Personal Use:** This software is free for personal, non-commercial use. You can download and use it on your personal devices without charge.
+
+**Commercial Use:** Use in a commercial environment (business, enterprise, or for-profit organization) requires a license fee. The installer will guide you to the payment page, or you can [pay for a commercial license here](https://paypal.me/mkultraware).
+
+**Redistribution:** You may not sell this software or repackage it for sale without explicit permission.
