@@ -2,7 +2,7 @@
 #define MyAppVersion "2.0"
 #define MyAppPublisher "Sekura"
 #define MyAppURL "https://sekura.se"
-#define MyAppExeName "clipboard_defanger.exe"
+#define MyAppExeName "PasteGuard.exe"
 
 [Setup]
 AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
@@ -47,7 +47,6 @@ Filename: "taskkill"; Parameters: "/F /IM {#MyAppExeName}"; Flags: runhidden
 [Code]
 var
   LicensePage: TInputOptionWizardPage;
-
 procedure InitializeWizard;
 begin
   LicensePage := CreateInputOptionPage(wpLicense,
