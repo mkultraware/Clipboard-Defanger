@@ -1,9 +1,13 @@
 import re
+import json
 import threading
 import tkinter as tk
+import winreg
 import logging
 import os
+import sys
 import ctypes
+import ctypes.wintypes
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import win32clipboard
 import win32con
@@ -12,22 +16,52 @@ import win32api
 import pystray
 from PIL import Image, ImageDraw
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-APP_NAME = "Sekura PasteGuard"
-LOG_FILE = os.path.join(os.path.expanduser("~"), "pasteguard.log")
+APP_NAME    = "Sekura PasteGuard"
+LOG_FILE    = os.path.join(os.path.expanduser("~"), "pasteguard.log")
+CONFIG_FILE = os.path.join(os.path.expanduser("~"), "pasteguard.json")
 
-state = {
+DEFAULT_STATE = {
     "silent_mode": False,
     "notifications": True,
-    "recent_value": "",
-    "icon": None,
+    "stats": {"blocked": 0, "cleaned": 0},
 }
 
-# ==========================================
-# LOGGING
-# ==========================================
+# --- Persistence ---
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            saved = json.load(f)
+        config = DEFAULT_STATE.copy()
+        config["silent_mode"]      = saved.get("silent_mode", DEFAULT_STATE["silent_mode"])
+        config["notifications"]    = saved.get("notifications", DEFAULT_STATE["notifications"])
+        config["stats"]["blocked"] = saved.get("stats", {}).get("blocked", 0)
+        config["stats"]["cleaned"] = saved.get("stats", {}).get("cleaned", 0)
+        return config
+    except Exception:
+        return DEFAULT_STATE.copy()
+
+def save_config():
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump({
+                "silent_mode":   state["silent_mode"],
+                "notifications": state["notifications"],
+                "stats":         state["stats"],
+            }, f, indent=2)
+    except Exception as e:
+        log(f"Config save failed: {e}", "warning")
+
+_saved = load_config()
+state = {
+    **_saved,
+    "recent_value": "",
+    "icon":         None,
+    "whitelist":    set(),  # session-only, cleared on restart
+}
+
+# --- Logging ---
+
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
@@ -39,66 +73,65 @@ def log(msg, level="info"):
     print(msg)
     getattr(logging, level)(msg)
 
-# ==========================================
-# TRACKING PARAMS
-# ==========================================
+# --- Tracking params ---
+
 TRACKING_PARAMS_SET = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "fbclid", "gclid", "dclid", "gbraid", "wbraid",
     "ttclid", "igshid", "twclid", "msclkid", "yclid",
-    "li_fat_id", "trk", "lipi",
-    "mc_eid", "_ga",
-    "si", "ref", "ref_"
+    "li_fat_id", "trk", "lipi", "mc_eid", "_ga",
+    "si", "ref", "ref_",
 }
 
-# ==========================================
-# COMMAND PATTERNS
-# Each tuple: (regex, human-readable label)
-# ==========================================
-COMMAND_PATTERNS = [
-    (r"powershell(?:\.exe)?",                                   "PowerShell"),
-    (r"-enc(?:odedcommand)?\s+[A-Za-z0-9+/=]{20,}",            "Encoded PowerShell command"),
+# --- Detection ---
+#
+# Tier 1: structurally unambiguous patterns, fire standalone.
+# Tier 2: tool name + shell signal required, prevents false positives
+#         when tool names appear in prose or documentation.
+
+TIER1_PATTERNS = [
     (r"cmd(?:\.exe)?\s*/[cCkK]",                                "CMD /c"),
-    (r"mshta(?:\.exe)?",                                        "MSHTA"),
-    (r"msiexec(?:\.exe)?",                                      "MSIExec"),
-    (r"rundll32(?:\.exe)?",                                     "RunDLL32"),
-    (r"certutil(?:\.exe)?",                                     "CertUtil"),
-    (r"wscript(?:\.exe)?",                                      "WScript"),
-    (r"cscript(?:\.exe)?",                                      "CScript"),
-    (r"wmic(?:\.exe)?",                                         "WMIC"),
-    (r"regsvr32(?:\.exe)?",                                     "RegSvr32"),
-    (r"bitsadmin(?:\.exe)?",                                    "BITSAdmin"),
-    (r"schtasks(?:\.exe)?",                                     "SchTasks"),
-    (r"reg\s+add",                                              "Registry write"),
-    (r"curl\s+https?://",                                       "curl download"),
+    (r"powershell(?:\.exe)?\s+-\w",                             "PowerShell"),
+    (r"-enc(?:odedcommand)?\s+[A-Za-z0-9+/=]{20,}",            "Encoded PowerShell command"),
     (r"Invoke-WebRequest|iwr\s+https?://",                      "Invoke-WebRequest"),
     (r"Invoke-RestMethod|irm\s+https?://",                      "Invoke-RestMethod"),
-    (r"Start-Process",                                          "Start-Process"),
+    (r"\biex\b|Invoke-Expression",                              "Invoke-Expression"),
     (r"DownloadString|DownloadFile",                            "WebClient download"),
-    (r"bash\s+-c\b",                                            "Bash (WSL)"),
-    # Context-aware base64: only flags when adjacent to a known executor
-    (r"(?:powershell|mshta|cmd|wscript|cscript|rundll32)"
-     r"[^\n]{0,60}[A-Za-z0-9+/]{60,}={0,2}",                   "Base64 payload"),
+    (r"&\s*\(\s*\$",                                            "Dynamic invocation"),
+    (r"curl\s+https?://",                                       "curl download"),
+    (r"reg\s+add\s+HKEY",                                       "Registry write"),
+    (r"bash\s+-c\s+[\"'$\{]",                                   "Bash (WSL)"),
+    (r"(?:powershell|mshta|cmd|wscript|cscript|rundll32)[^\n]{0,60}[A-Za-z0-9+/]{60,}={0,2}",
+                                                                "Base64 payload"),
 ]
 
-COMPILED_PATTERNS = [
-    (re.compile(pattern, re.IGNORECASE), label)
-    for pattern, label in COMMAND_PATTERNS
-]
+_SHELL_TOOLS = r"(?:mshta|msiexec|rundll32|certutil|wscript|cscript|wmic|regsvr32|bitsadmin|schtasks|powershell|cmd)"
+_SHELL_SIGNAL = (
+    r"(?:"
+    r"\s*[|&;]\s*"
+    r"|\s+https?://"
+    r"|\s+-\w"
+    r"|\s+//?\w"
+    r"|\s+\$\w"
+    r"|\s+vbscript:"
+    r"|\s+javascript:"
+    r"|\s+\S+\.(?:dll|vbs|js|hta|bat|ps1|cmd|exe)\b"
+    r")"
+)
 
-# ==========================================
-# DETECTION
-# ==========================================
+COMPILED_TIER1 = [(re.compile(p, re.IGNORECASE), l) for p, l in TIER1_PATTERNS]
+COMPILED_TIER2 = re.compile(_SHELL_TOOLS + r"(?:\.exe)?" + _SHELL_SIGNAL, re.IGNORECASE)
 
 def detect_command(text):
-    for pattern, label in COMPILED_PATTERNS:
+    for pattern, label in COMPILED_TIER1:
         if pattern.search(text):
             return True, label
+    m = COMPILED_TIER2.search(text)
+    if m:
+        return True, f"Shell command ({m.group(0).strip()[:40]})"
     return False, None
 
-# ==========================================
-# URL CLEANING
-# ==========================================
+# --- URL cleaning ---
 
 def clean_url(text):
     text = text.strip()
@@ -114,9 +147,7 @@ def clean_url(text):
     except Exception:
         return None
 
-# ==========================================
-# TRAY NOTIFICATION
-# ==========================================
+# --- Notifications ---
 
 def notify_tray(title, message):
     if not state["notifications"]:
@@ -127,122 +158,179 @@ def notify_tray(title, message):
     except Exception:
         log(f"[NOTIFY] {title}: {message}")
 
-# ==========================================
-# WARNING DIALOG
-# ==========================================
+# --- System theme ---
+
+def is_dark_mode():
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        )
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return value == 0
+    except Exception:
+        return True  # default to dark
+
+# --- Windows 11 rounded corners ---
+
+def apply_rounded_corners(hwnd):
+    try:
+        DWMWA_WINDOW_CORNER_PREFERENCE = 33
+        DWMWCP_ROUND = 2
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(ctypes.c_int(DWMWCP_ROUND)),
+            ctypes.sizeof(ctypes.c_int)
+        )
+    except Exception:
+        pass
+
+# --- Warning dialog ---
 
 def show_warning_dialog(payload_text, trigger_label):
+    """Returns: 'cancel' | 'keep' | 'whitelist'"""
+    dark = is_dark_mode()
+
+    # Colors based on system theme
+    if dark:
+        bg          = "#1c1c1e"
+        surface     = "#2c2c2e"
+        text_pri    = "#ffffff"
+        text_sec    = "#ababab"
+        text_dim    = "#636366"
+        accent      = "#f0a500"
+        btn_cancel  = "#3a3a3c"
+        btn_cancel_fg = "#ffffff"
+        btn_keep    = "#2c2c2e"
+        btn_keep_fg = "#ababab"
+        btn_trust   = "#1c3a1c"
+        btn_trust_fg = "#4cd964"
+        border      = "#3a3a3c"
+    else:
+        bg          = "#f2f2f7"
+        surface     = "#ffffff"
+        text_pri    = "#000000"
+        text_sec    = "#3c3c43"
+        text_dim    = "#8e8e93"
+        accent      = "#c07800"
+        btn_cancel  = "#e5e5ea"
+        btn_cancel_fg = "#000000"
+        btn_keep    = "#e5e5ea"
+        btn_keep_fg = "#3c3c43"
+        btn_trust   = "#d4edda"
+        btn_trust_fg = "#1a7a2e"
+        border      = "#d1d1d6"
+
+    # Flash fix: invisible root, never shown
     root = tk.Tk()
+    root.geometry("0x0+0+0")
+    root.attributes("-alpha", 0)
     root.withdraw()
 
     dialog = tk.Toplevel(root)
-    dialog.title("PasteGuard Warning")
-    dialog.geometry("520x300")
+    dialog.title("")
+    dialog.geometry("480x310")
     dialog.resizable(False, False)
     dialog.attributes("-topmost", True)
-    dialog.configure(bg="#1a1a1a")
+    dialog.configure(bg=bg)
+    dialog.overrideredirect(False)
 
     dialog.update_idletasks()
-    x = (dialog.winfo_screenwidth() // 2) - 260
-    y = (dialog.winfo_screenheight() // 2) - 150
+    x = (dialog.winfo_screenwidth()  // 2) - 240
+    y = (dialog.winfo_screenheight() // 2) - 155
     dialog.geometry(f"+{x}+{y}")
 
-    result = {"keep": False}
+    # Apply Windows 11 rounded corners
+    dialog.update()
+    hwnd = ctypes.windll.user32.GetParent(dialog.winfo_id())
+    if hwnd == 0:
+        hwnd = dialog.winfo_id()
+    apply_rounded_corners(hwnd)
 
-    tk.Label(
-        dialog,
-        text="⚠  Windows Command Detected",
-        font=("Segoe UI", 13, "bold"),
-        fg="#f0a500",
-        bg="#1a1a1a"
-    ).pack(pady=(18, 4))
+    result = {"action": "cancel"}
 
-    tk.Label(
-        dialog,
-        text=(
-            "You have copied what appears to be a Windows command.\n"
-            "Many sites use this as a fake CAPTCHA to deliver malware.\n\n"
-            "Only proceed if you know exactly what this command does."
-        ),
-        font=("Segoe UI", 9),
-        fg="#cccccc",
-        bg="#1a1a1a",
-        justify="center",
-        wraplength=480
-    ).pack(pady=(0, 6))
+    # App label
+    tk.Label(dialog, text="Sekura PasteGuard",
+             font=("Segoe UI", 9), fg=text_dim, bg=bg).pack(pady=(20, 0))
 
-    tk.Label(
-        dialog,
-        text=f"Triggered by: {trigger_label}",
-        font=("Segoe UI", 9, "italic"),
-        fg="#f0a500",
-        bg="#1a1a1a"
-    ).pack(pady=(0, 6))
+    # Title
+    tk.Label(dialog, text="Suspicious command detected",
+             font=("Segoe UI", 14, "bold"), fg=text_pri, bg=bg).pack(pady=(4, 0))
 
-    snippet = payload_text[:140].replace("\n", " ").replace("\r", "")
-    if len(payload_text) > 140:
+    # Trigger label
+    tk.Label(dialog, text=f"Triggered by: {trigger_label}",
+             font=("Segoe UI", 9), fg=accent, bg=bg).pack(pady=(4, 0))
+
+    # Divider
+    tk.Frame(dialog, height=1, bg=border).pack(fill="x", padx=24, pady=(12, 0))
+
+    # Snippet
+    snippet = payload_text[:120].replace("\n", " ").replace("\r", "")
+    if len(payload_text) > 120:
         snippet += "..."
-    tk.Label(
-        dialog,
-        text=snippet,
-        font=("Courier New", 8),
-        fg="#777777",
-        bg="#111111",
-        wraplength=480,
-        justify="left",
-        anchor="w",
-        padx=8,
-        pady=6
-    ).pack(fill="x", padx=16, pady=(0, 14))
+    tk.Label(dialog, text=snippet,
+             font=("Cascadia Code", 8) if True else ("Courier New", 8),
+             fg=text_sec, bg=surface,
+             wraplength=420, justify="left", anchor="w",
+             padx=12, pady=8).pack(fill="x", padx=24, pady=(12, 0))
 
-    btn_frame = tk.Frame(dialog, bg="#1a1a1a")
-    btn_frame.pack()
+    # Subtext
+    tk.Label(dialog,
+             text="Only proceed if you know exactly what this command does.",
+             font=("Segoe UI", 8), fg=text_dim, bg=bg,
+             wraplength=420).pack(pady=(10, 0))
+
+    # Divider
+    tk.Frame(dialog, height=1, bg=border).pack(fill="x", padx=24, pady=(12, 0))
+
+    # Buttons
+    btn_frame = tk.Frame(dialog, bg=bg)
+    btn_frame.pack(pady=(10, 0))
 
     def on_cancel():
-        result["keep"] = False
+        result["action"] = "cancel"
         dialog.destroy()
         root.destroy()
 
     def on_keep():
-        result["keep"] = True
+        result["action"] = "keep"
         dialog.destroy()
         root.destroy()
 
-    tk.Button(
-        btn_frame,
-        text="Cancel (Clear Clipboard)",
-        command=on_cancel,
-        font=("Segoe UI", 9, "bold"),
-        bg="#c0392b",
-        fg="white",
-        relief="flat",
-        padx=14,
-        pady=6,
-        cursor="hand2"
-    ).pack(side="left", padx=(0, 10))
+    def on_whitelist():
+        result["action"] = "whitelist"
+        dialog.destroy()
+        root.destroy()
 
-    tk.Button(
-        btn_frame,
-        text="Copy Anyway",
-        command=on_keep,
-        font=("Segoe UI", 9),
-        bg="#2d2d2d",
-        fg="#aaaaaa",
-        relief="flat",
-        padx=14,
-        pady=6,
-        cursor="hand2"
-    ).pack(side="left")
+    btn_cfg = {"relief": "flat", "padx": 16, "pady": 6, "cursor": "hand2", "bd": 0}
+
+    tk.Button(btn_frame, text="Clear Clipboard", command=on_cancel,
+              font=("Segoe UI", 9, "bold"),
+              bg="#c0392b", fg="#ffffff",
+              activebackground="#a93226", activeforeground="#ffffff",
+              **btn_cfg).pack(side="left", padx=(0, 8))
+
+    tk.Button(btn_frame, text="Copy Anyway", command=on_keep,
+              font=("Segoe UI", 9),
+              bg=btn_keep, fg=btn_keep_fg,
+              activebackground=border, activeforeground=text_pri,
+              **btn_cfg).pack(side="left", padx=(0, 8))
+
+    tk.Button(btn_frame, text="Trust This Session", command=on_whitelist,
+              font=("Segoe UI", 9),
+              bg=btn_trust, fg=btn_trust_fg,
+              activebackground=btn_trust, activeforeground=btn_trust_fg,
+              **btn_cfg).pack(side="left")
 
     dialog.protocol("WM_DELETE_WINDOW", on_cancel)
     dialog.grab_set()
     root.wait_window(dialog)
 
-    return result["keep"]
+    return result["action"]
 
-# ==========================================
-# CLIPBOARD READ/WRITE
-# ==========================================
+# --- Clipboard I/O ---
 
 def get_clipboard_text():
     try:
@@ -285,9 +373,7 @@ def set_clipboard_text(text):
         except Exception:
             pass
 
-# ==========================================
-# CLIPBOARD PROCESSING
-# ==========================================
+# --- Clipboard processing ---
 
 def process_clipboard(text):
     if text == state["recent_value"]:
@@ -297,17 +383,31 @@ def process_clipboard(text):
     is_cmd, label = detect_command(text)
 
     if is_cmd:
+        if label in state["whitelist"]:
+            log(f"Whitelisted pattern skipped [{label}]")
+            return
+
         log(f"Command detected [{label}]: {text[:100]!r}")
+
         if state["silent_mode"]:
             clear_clipboard()
             state["recent_value"] = ""
+            state["stats"]["blocked"] += 1
+            save_config()
+            update_tray_menu()
             log("Silently cleared.")
         else:
-            keep = show_warning_dialog(text, label)
-            if not keep:
+            action = show_warning_dialog(text, label)
+            if action == "cancel":
                 clear_clipboard()
                 state["recent_value"] = ""
+                state["stats"]["blocked"] += 1
+                save_config()
+                update_tray_menu()
                 log("User cancelled. Clipboard cleared.")
+            elif action == "whitelist":
+                state["whitelist"].add(label)
+                log(f"Pattern whitelisted for session: {label}")
             else:
                 log("User chose to keep command in clipboard.")
     else:
@@ -315,12 +415,13 @@ def process_clipboard(text):
         if cleaned:
             set_clipboard_text(cleaned)
             state["recent_value"] = cleaned
+            state["stats"]["cleaned"] += 1
+            save_config()
+            update_tray_menu()
             log(f"URL cleaned -> {cleaned}")
             notify_tray("URL Cleaned", "Tracking parameters removed.")
 
-# ==========================================
-# EVENT-DRIVEN CLIPBOARD LISTENER
-# ==========================================
+# --- Clipboard listener (event-driven via WM_CLIPBOARDUPDATE) ---
 
 WM_CLIPBOARDUPDATE = 0x031D
 
@@ -328,41 +429,30 @@ def clipboard_wnd_proc(hwnd, msg, wparam, lparam):
     if msg == WM_CLIPBOARDUPDATE:
         text = get_clipboard_text()
         if text:
-            threading.Thread(
-                target=process_clipboard,
-                args=(text,),
-                daemon=True
-            ).start()
+            threading.Thread(target=process_clipboard, args=(text,), daemon=True).start()
     elif msg == win32con.WM_DESTROY:
         win32gui.PostQuitMessage(0)
     return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
 def run_clipboard_listener():
     wc = win32gui.WNDCLASS()
-    wc.lpfnWndProc = clipboard_wnd_proc
+    wc.lpfnWndProc   = clipboard_wnd_proc
     wc.lpszClassName = "PasteGuardListener"
-    wc.hInstance = win32api.GetModuleHandle(None)
+    wc.hInstance     = win32api.GetModuleHandle(None)
     win32gui.RegisterClass(wc)
 
     hwnd = win32gui.CreateWindow(
-        wc.lpszClassName,
-        "PasteGuard Listener",
-        0, 0, 0, 0, 0,
-        win32con.HWND_MESSAGE,
-        0, wc.hInstance, None
+        wc.lpszClassName, "PasteGuard Listener",
+        0, 0, 0, 0, 0, win32con.HWND_MESSAGE, 0, wc.hInstance, None
     )
 
     ctypes.windll.user32.AddClipboardFormatListener(hwnd)
-    log("Event-driven clipboard listener active.")
+    log("Clipboard listener active.")
     win32gui.PumpMessages()
 
-# ==========================================
-# TRAY ICON
-# ==========================================
+# --- Tray ---
 
 def resource_path(filename):
-    """Get path to resource, works for both script and PyInstaller bundle."""
-    import sys
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, filename)
 
@@ -370,18 +460,20 @@ def create_icon_image():
     try:
         return Image.open(resource_path("clipboard-x.512.ico"))
     except Exception:
-        image = Image.new("RGB", (64, 64), "#1a1a2e")
-        dc = ImageDraw.Draw(image)
+        img = Image.new("RGB", (64, 64), "#1a1a2e")
+        dc  = ImageDraw.Draw(img)
         dc.rectangle((16, 16, 48, 48), fill="#f0a500")
-        return image
+        return img
 
 def toggle_silent_mode(icon, item):
     state["silent_mode"] = not state["silent_mode"]
+    save_config()
     log(f"Silent mode: {'ON' if state['silent_mode'] else 'OFF'}")
     icon.update_menu()
 
 def toggle_notifications(icon, item):
     state["notifications"] = not state["notifications"]
+    save_config()
     log(f"Notifications: {'ON' if state['notifications'] else 'OFF'}")
     icon.update_menu()
 
@@ -389,10 +481,15 @@ def open_log(icon, item):
     os.startfile(LOG_FILE)
 
 def on_quit(icon, item):
+    save_config()
     icon.stop()
 
 def build_menu():
+    blocked = state["stats"]["blocked"]
+    cleaned = state["stats"]["cleaned"]
     return pystray.Menu(
+        pystray.MenuItem(f"🛡 Blocked: {blocked}   🔗 Cleaned: {cleaned}", None, enabled=False),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem(
             lambda item: f"Silent Mode: {'ON' if state['silent_mode'] else 'OFF'}",
             toggle_silent_mode
@@ -406,14 +503,17 @@ def build_menu():
         pystray.MenuItem("Quit", on_quit),
     )
 
+def update_tray_menu():
+    if state["icon"]:
+        state["icon"].menu = build_menu()
+        state["icon"].update_menu()
+
 def main():
-    icon_image = create_icon_image()
-    icon = pystray.Icon(APP_NAME, icon_image, APP_NAME, build_menu())
+    icon_image    = create_icon_image()
+    icon          = pystray.Icon(APP_NAME, icon_image, APP_NAME, build_menu())
     state["icon"] = icon
 
-    listener_thread = threading.Thread(target=run_clipboard_listener, daemon=True)
-    listener_thread.start()
-
+    threading.Thread(target=run_clipboard_listener, daemon=True).start()
     icon.run()
 
 if __name__ == "__main__":
